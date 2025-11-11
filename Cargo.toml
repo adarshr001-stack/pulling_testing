@@ -1,0 +1,26 @@
+[package]
+name = "sftp_puller_main"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ssh2 = "0.9"                # For SFTP connection
+aws-config = "1.2"          # For S3-compatible storage config
+aws-sdk-s3 = "1.15"         # For uploading to MinIO / Ceph
+aws-types = "1.2"
+tokio = { version = "1", features = ["full"] }  # Async runtime
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+anyhow = "1.0"              # Error handling
+tracing = "0.1"             # Logging
+dotenv = "0.15"        # load .env file
+base64 = "0.21"        # For decoding private key content
+
+
+# Extra helpers for custom endpoint + credentials
+aws-credential-types = "1.2"
+aws-smithy-http = "0.60.10"   # needed for Endpoint/Uri builder
+reqwest = "0.12.24"
+bytes = "1.10.1"
+tokio-stream = "0.1.17"
+rusqlite = "0.37.0"
