@@ -81,23 +81,25 @@ impl Config {
 struct SftpConnection {
     config: Config,
     sftp: Arc<Mutex<Option<ssh2::Sftp>>>,
+    worker_id: usize,
 }
 
 impl SftpConnection {
-    async fn new(config: Config) -> Result<Self> {
-        let sftp = create_sftp_session_with_retry(&config).await?;
+    async fn new(config: Config, worker_id: usize) -> Result<Self> {
+        let sftp = create_sftp_session_with_retry(&config, worker_id).await?;
         Ok(Self {
             config,
             sftp: Arc::new(Mutex::new(Some(sftp))),
+            worker_id,
         })
     }
 
     async fn reconnect(&self) -> Result<()> {
-        println!("🔄 Attempting to reconnect SFTP session...");
-        let new_sftp = create_sftp_session_with_retry(&self.config).await?;
+        println!("[Worker {}] 🔄 Attempting to reconnect SFTP session...", self.worker_id);
+        let new_sftp = create_sftp_session_with_retry(&self.config, self.worker_id).await?;
         let mut sftp_guard = self.sftp.lock().await;
         *sftp_guard = Some(new_sftp);
-        println!("✅ SFTP session reconnected successfully");
+        println!("[Worker {}] ✅ SFTP session reconnected successfully", self.worker_id);
         Ok(())
     }
 
@@ -108,52 +110,54 @@ impl SftpConnection {
 
 #[tokio::main]
 async fn main() -> Result<()> {   
-    println!("PROCESS ID: {}", process::id());
+    let worker_id = 1; // Main worker ID (for single-threaded mode)
+    
+    println!("[Worker {}] PROCESS ID: {}", worker_id, process::id());
     let cfg = Config::from_env()?;
 
-    println!("Loaded config: {:?}", cfg);
+    println!("[Worker {}] Loaded config: {:?}", worker_id, cfg);
 
     // Create SFTP connection with retry support
-    let sftp_conn = SftpConnection::new(cfg.clone()).await?;
-    let s3_client = create_s3_client(&cfg).await?;
+    let sftp_conn = SftpConnection::new(cfg.clone(), worker_id).await?;
+    let s3_client = create_s3_client(&cfg, worker_id).await?;
 
     // List all files recursively
     let all_files = {
         let sftp_guard = sftp_conn.get_sftp().await;
         let sftp_lock = sftp_guard.lock().await;
         let sftp_ref = sftp_lock.as_ref().ok_or_else(|| anyhow!("SFTP connection not available"))?;
-        list_sftp_files_recursively(sftp_ref, Path::new(&cfg.bank_remote_path))?
+        list_sftp_files_recursively(sftp_ref, Path::new(&cfg.bank_remote_path), worker_id)?
     };
     
-    println!("Found {} files on SFTP server", all_files.len());
+    println!("[Worker {}] Found {} files on SFTP server", worker_id, all_files.len());
 
     // Process each file sequentially
     for remote_path in all_files {
-        println!("\n=== Processing file: {:?} ===", remote_path);
+        println!("[Worker {}]\n=== Processing file: {:?} ===", worker_id, remote_path);
         
         let mut cfg_file = cfg.clone();
         cfg_file.bank_remote_path = remote_path.clone();
         
         if let Err(e) = upload_to_storage_with_retry(&cfg_file, &sftp_conn, s3_client.clone()).await {
-            eprintln!("❌ Failed to upload {:?}: {}", remote_path, e);
+            eprintln!("[Worker {}] ❌ Failed to upload {:?}: {}", worker_id, remote_path, e);
         } else {
-            println!("✅ Uploaded {:?}", remote_path);
+            println!("[Worker {}] ✅ Uploaded {:?}", worker_id, remote_path);
         }
     }
 
-    println!("Successfully transferred all files.");
+    println!("[Worker {}] Successfully transferred all files.", worker_id);
     Ok(())
 }
 
 use ssh2::Sftp;
 
-fn list_sftp_files_recursively(sftp: &Sftp, path: &Path) -> Result<Vec<String>> {
+fn list_sftp_files_recursively(sftp: &Sftp, path: &Path, worker_id: usize) -> Result<Vec<String>> {
     let mut files = Vec::new();
 
     let entries = match sftp.readdir(path) {
         Ok(e) => e,
         Err(err) => {
-            eprintln!("⚠️ Cannot read {:?}: {}", path, err);
+            eprintln!("[Worker {}] ⚠️ Cannot read {:?}: {}", worker_id, path, err);
             return Ok(files);
         }
     };
@@ -171,7 +175,7 @@ fn list_sftp_files_recursively(sftp: &Sftp, path: &Path) -> Result<Vec<String>> 
         let full_path = entry_path.to_string_lossy().to_string();
 
         if stat.is_dir() {
-            let mut nested = list_sftp_files_recursively(sftp, &entry_path)?;
+            let mut nested = list_sftp_files_recursively(sftp, &entry_path, worker_id)?;
             files.append(&mut nested);
         } else {
             files.push(full_path);
@@ -182,17 +186,17 @@ fn list_sftp_files_recursively(sftp: &Sftp, path: &Path) -> Result<Vec<String>> 
 }
 
 // Create SFTP session with retry logic
-async fn create_sftp_session_with_retry(cfg: &Config) -> Result<ssh2::Sftp> {
+async fn create_sftp_session_with_retry(cfg: &Config, worker_id: usize) -> Result<ssh2::Sftp> {
     let mut attempts = 0;
     let max_attempts = cfg.max_retries + 1;
 
     loop {
         attempts += 1;
         
-        match create_sftp_session(cfg).await {
+        match create_sftp_session(cfg, worker_id).await {
             Ok(sftp) => {
                 if attempts > 1 {
-                    println!("✅ Successfully connected after {} attempts", attempts);
+                    println!("[Worker {}] ✅ Successfully connected after {} attempts", worker_id, attempts);
                 }
                 return Ok(sftp);
             }
@@ -201,8 +205,8 @@ async fn create_sftp_session_with_retry(cfg: &Config) -> Result<ssh2::Sftp> {
                     return Err(anyhow!("Failed to connect after {} attempts: {}", attempts, e));
                 }
                 
-                eprintln!("⚠️ Connection attempt {}/{} failed: {}", attempts, max_attempts, e);
-                eprintln!("🔄 Retrying in {} seconds...", cfg.retry_delay_secs);
+                eprintln!("[Worker {}] ⚠️ Connection attempt {}/{} failed: {}", worker_id, attempts, max_attempts, e);
+                eprintln!("[Worker {}] 🔄 Retrying in {} seconds...", worker_id, cfg.retry_delay_secs);
                 
                 tokio::time::sleep(Duration::from_secs(cfg.retry_delay_secs)).await;
             }
@@ -210,7 +214,7 @@ async fn create_sftp_session_with_retry(cfg: &Config) -> Result<ssh2::Sftp> {
     }
 }
 
-async fn create_sftp_session(cfg: &Config) -> Result<ssh2::Sftp> {
+async fn create_sftp_session(cfg: &Config, worker_id: usize) -> Result<ssh2::Sftp> {
     let tcp = TcpStream::connect(format!("{}:{}", cfg.bank_host, cfg.bank_port))
         .context("Failed to connect to SFTP server")?;
     
@@ -219,7 +223,7 @@ async fn create_sftp_session(cfg: &Config) -> Result<ssh2::Sftp> {
     sess.handshake().context("SSH handshake failed")?;
 
     if let Some(ref key_content) = cfg.bank_private_key_content {
-        let temp_key_path = "/tmp/sftp_temp_key.pem";
+        let temp_key_path = format!("/tmp/sftp_temp_key_worker_{}.pem", worker_id);
         
         let formatted_key = if key_content.contains("-----BEGIN") && key_content.contains("-----END") {
             let parts: Vec<&str> = key_content.split("-----").collect();
@@ -247,27 +251,27 @@ async fn create_sftp_session(cfg: &Config) -> Result<ssh2::Sftp> {
             key_content.clone()
         };
         
-        fs::write(temp_key_path, formatted_key)
+        fs::write(&temp_key_path, formatted_key)
             .context("Failed to write private key to temporary file")?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(temp_key_path, fs::Permissions::from_mode(0o600))?;
+            fs::set_permissions(&temp_key_path, fs::Permissions::from_mode(0o600))?;
         }
 
-        println!("✓ Using private key from BANK_PRIVATE_KEY_CONTENT");
+        println!("[Worker {}] ✓ Using private key from BANK_PRIVATE_KEY_CONTENT", worker_id);
 
         sess.userauth_pubkey_file(
             &cfg.bank_username,
             None,
-            Path::new(temp_key_path),
+            Path::new(&temp_key_path),
             None,
         ).context("SSH authentication failed")?;
 
-        let _ = fs::remove_file(temp_key_path);
+        let _ = fs::remove_file(&temp_key_path);
     } else if let Some(ref path) = cfg.bank_private_key_path {
-        println!("✓ Using private key from path: {}", path);
+        println!("[Worker {}] ✓ Using private key from path: {}", worker_id, path);
         sess.userauth_pubkey_file(&cfg.bank_username, None, Path::new(path), None)
             .context("SSH authentication failed")?;
     } else {
@@ -279,11 +283,13 @@ async fn create_sftp_session(cfg: &Config) -> Result<ssh2::Sftp> {
     }
 
     let sftp = sess.sftp().context("Failed to open SFTP session")?;
-    println!("✓ SFTP session established!");
+    println!("[Worker {}] ✓ SFTP session established!", worker_id);
     Ok(sftp)
 }
 
-async fn create_s3_client(cfg: &Config) -> Result<S3Client> {
+async fn create_s3_client(cfg: &Config, worker_id: usize) -> Result<S3Client> {
+    println!("[Worker {}] Creating S3 client...", worker_id);
+    
     let region = Region::new(cfg.storage_region.clone());
 
     let base_config = aws_config::from_env()
@@ -324,46 +330,70 @@ fn is_connection_error(error: &std::io::Error) -> bool {
     )
 }
 
-// Wrapper function with retry logic
+// Wrapper function with retry logic - retries the ENTIRE file upload on failure
 async fn upload_to_storage_with_retry(
     cfg: &Config,
     sftp_conn: &SftpConnection,
     s3_client: S3Client,
 ) -> Result<()> {
-    let mut retry_count = 0;
     let max_retries = cfg.max_retries;
+    let worker_id = sftp_conn.worker_id;
 
-    loop {
+    for attempt in 1..=max_retries + 1 {
+        println!("[Worker {}] 📁 Attempting to upload file (attempt {}/{}): {}", 
+            worker_id, attempt, max_retries + 1, cfg.bank_remote_path);
+        
         match upload_to_storage(cfg, sftp_conn, s3_client.clone()).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                if attempt > 1 {
+                    println!("[Worker {}] ✅ File upload succeeded after {} attempts", worker_id, attempt);
+                }
+                return Ok(());
+            }
             Err(e) => {
                 let error_msg = format!("{}", e);
                 
-                // Check if it's a connection error that we should retry
+                // Check if it's an error we should retry
                 let should_retry = error_msg.contains("connection")
                     || error_msg.contains("Connection")
                     || error_msg.contains("broken pipe")
                     || error_msg.contains("timeout")
-                    || error_msg.contains("EOF");
+                    || error_msg.contains("EOF")
+                    || error_msg.contains("SFTP")
+                    || error_msg.contains("SSH");
 
-                if should_retry && retry_count < max_retries {
-                    retry_count += 1;
-                    eprintln!("⚠️ Upload failed (attempt {}/{}): {}", retry_count, max_retries + 1, e);
-                    eprintln!("🔄 Reconnecting and retrying in {} seconds...", cfg.retry_delay_secs);
+                if should_retry && attempt <= max_retries {
+                    eprintln!("[Worker {}] ⚠️ Upload failed (attempt {}/{}): {}", worker_id, attempt, max_retries + 1, e);
+                    eprintln!("[Worker {}] 🔄 Will retry complete file upload after reconnecting...", worker_id);
                     
+                    // Wait before retry
                     tokio::time::sleep(Duration::from_secs(cfg.retry_delay_secs)).await;
                     
-                    // Attempt to reconnect
-                    if let Err(reconnect_err) = sftp_conn.reconnect().await {
-                        eprintln!("⚠️ Reconnection failed: {}", reconnect_err);
-                        continue;
+                    // Attempt to reconnect SFTP
+                    match sftp_conn.reconnect().await {
+                        Ok(()) => {
+                            println!("[Worker {}] ✅ Reconnected successfully, retrying file upload from beginning...", worker_id);
+                        }
+                        Err(reconnect_err) => {
+                            eprintln!("[Worker {}] ⚠️ Reconnection failed: {}", worker_id, reconnect_err);
+                            if attempt < max_retries + 1 {
+                                eprintln!("[Worker {}] 🔄 Will retry reconnection on next attempt...", worker_id);
+                                continue;
+                            }
+                        }
                     }
                 } else {
-                    return Err(e);
+                    if attempt > max_retries {
+                        return Err(anyhow!("File upload failed after {} attempts: {}", attempt, e));
+                    } else {
+                        return Err(e);
+                    }
                 }
             }
         }
     }
+
+    Err(anyhow!("File upload failed after all retry attempts"))
 }
 
 async fn upload_to_storage(
@@ -371,6 +401,7 @@ async fn upload_to_storage(
     sftp_conn: &SftpConnection,
     s3_client: S3Client,
 ) -> Result<()> {
+    let worker_id = sftp_conn.worker_id;
     
     // 1. Initiate Multipart Upload
     let mpu = s3_client
@@ -378,17 +409,18 @@ async fn upload_to_storage(
         .bucket(cfg.storage_bucket.clone())
         .key(cfg.bank_remote_path.clone())
         .send()
-        .await?;
+        .await
+        .context("Failed to initiate multipart upload")?;
 
     let upload_id = mpu.upload_id().ok_or_else(|| anyhow!("S3 response missing UploadId"))?;
-    println!("📤 Initiated MPU. UploadId: {}", upload_id);
+    println!("[Worker {}] 📤 Initiated MPU. UploadId: {}", worker_id, upload_id);
 
     let transfer_result = async { 
         let mut part_number = 1;
         let mut completed_parts = Vec::new();
         let mut total_bytes_read: u64 = 0;
 
-        // Open SFTP file with retry logic
+        // Open SFTP file - this will fail if connection is lost
         let mut sftp_file = {
             let sftp_guard = sftp_conn.get_sftp().await;
             let sftp_lock = sftp_guard.lock().await;
@@ -400,9 +432,11 @@ async fn upload_to_storage(
                 
                 move || -> Result<File> {
                     sftp_clone.open(Path::new(&sftp_path))
-                        .context(format!("SFTP file open failed: {}", sftp_path))
+                        .context(format!("Failed to open SFTP file: {}", sftp_path))
                 }
-            }).await??
+            }).await
+                .context("Task spawn failed")?
+                .context("SFTP file open failed")?
         };
 
         // Stream parts with connection recovery
@@ -410,32 +444,32 @@ async fn upload_to_storage(
             let (file_out, read_result) = tokio::task::spawn_blocking({
                 let mut sftp_file_ref = sftp_file;
                 let chunk_size = cfg.upload_chunk_size;
-                let current_offset = total_bytes_read;
                 
                 move || -> (File, std::io::Result<(Vec<u8>, usize)>) {
                     let mut chunk_buffer = vec![0u8; chunk_size];
                     let mut bytes_in_buffer = 0;
-                    let mut retry_on_this_read = 0;
-                    let max_read_retries = 3;
 
+                    // Read until buffer is full or EOF
                     loop {
                         let bytes_read = match sftp_file_ref.read(&mut chunk_buffer[bytes_in_buffer..]) {
                             Ok(0) => {
                                 break; // EOF
                             },
                             Ok(n) => n,
-                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                            Err(e) if is_connection_error(&e) && retry_on_this_read < max_read_retries => {
-                                retry_on_this_read += 1;
-                                eprintln!("⚠️ Read error (retry {}/{}): {}", retry_on_this_read, max_read_retries, e);
-                                thread::sleep(Duration::from_secs(2));
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                                // Interrupted is recoverable, just retry
                                 continue;
                             },
-                            Err(e) => return (sftp_file_ref, Err(e)),
+                            Err(e) => {
+                                // Any other error - propagate it
+                                // Connection errors will be caught by outer retry logic
+                                return (sftp_file_ref, Err(e));
+                            }
                         };
 
                         bytes_in_buffer += bytes_read;
 
+                        // If buffer is full, we're done with this chunk
                         if bytes_in_buffer == chunk_buffer.len() {
                             break;
                         }
@@ -447,28 +481,33 @@ async fn upload_to_storage(
 
             sftp_file = file_out;
             
+            // Check for read errors and propagate connection errors
             let (mut buffer, bytes_read) = match read_result {
                 Ok(result) => result,
                 Err(e) if is_connection_error(&e) => {
-                    eprintln!("⚠️ Connection error detected during read: {}", e);
-                    return Err(anyhow!("SFTP connection error: {}", e));
+                    // Connection error - this will trigger reconnect and full file retry
+                    return Err(anyhow!("SFTP connection lost during read: {}", e));
                 }
-                Err(e) => return Err(anyhow!("SFTP read error: {}", e)),
+                Err(e) => {
+                    // Other IO errors
+                    return Err(anyhow!("SFTP read error: {}", e));
+                }
             };
 
             if bytes_read == 0 {
-                println!("📄 End of file reached. Total bytes read: {}", total_bytes_read);
+                println!("[Worker {}] 📄 End of file reached. Total bytes read: {}", worker_id, total_bytes_read);
                 break;
             }
 
             total_bytes_read += bytes_read as u64;
-            println!("📊 Read chunk of {} bytes for part {} (total: {} bytes)", 
-                bytes_read, part_number, total_bytes_read);
+            println!("[Worker {}] 📊 Read chunk of {} bytes for part {} (total: {} bytes)", 
+                worker_id, bytes_read, part_number, total_bytes_read);
 
             buffer.truncate(bytes_read);
 
-            // Upload part with retry
+            // Upload part with retry (for transient S3 errors)
             let mut upload_retry = 0;
+            let max_part_retries = 3;
             let part_resp = loop {
                 match s3_client
                     .upload_part()
@@ -481,20 +520,24 @@ async fn upload_to_storage(
                     .await
                 {
                     Ok(resp) => break resp,
-                    Err(e) if upload_retry < 3 => {
+                    Err(e) if upload_retry < max_part_retries => {
                         upload_retry += 1;
-                        eprintln!("⚠️ S3 upload part {} retry {}/3: {}", part_number, upload_retry, e);
+                        eprintln!("[Worker {}] ⚠️ S3 upload part {} failed (retry {}/{}): {}", 
+                            worker_id, part_number, upload_retry, max_part_retries, e);
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
-                    Err(e) => return Err(anyhow!("S3 UploadPart {} failed: {}", part_number, e)),
+                    Err(e) => {
+                        return Err(anyhow!("S3 UploadPart {} failed after {} retries: {}", 
+                            part_number, max_part_retries, e));
+                    }
                 }
             };
             
             let etag = part_resp.e_tag()
                 .ok_or_else(|| anyhow!("S3 response missing ETag for part {}", part_number))?;
             
-            println!("✅ Uploaded part {} (ETag: {})", part_number, etag);
+            println!("[Worker {}] ✅ Uploaded part {} (ETag: {})", worker_id, part_number, etag);
 
             completed_parts.push(
                 CompletedPart::builder()
@@ -508,7 +551,7 @@ async fn upload_to_storage(
 
         // Finalize transfer
         if !completed_parts.is_empty() {
-            println!("🏁 Completing multipart upload...");
+            println!("[Worker {}] 🏁 Completing multipart upload...", worker_id);
             let mpu_completion = CompletedMultipartUpload::builder()
                 .set_parts(Some(completed_parts))
                 .build();
@@ -523,9 +566,9 @@ async fn upload_to_storage(
                 .await
                 .context("Failed to complete multipart upload")?;
             
-            println!("✅ Multipart upload completed successfully");
+            println!("[Worker {}] ✅ Multipart upload completed successfully", worker_id);
         } else {
-            println!("📄 File was empty, handling as zero-byte file");
+            println!("[Worker {}] 📄 File was empty, handling as zero-byte file", worker_id);
             
             s3_client
                 .abort_multipart_upload()
@@ -549,10 +592,12 @@ async fn upload_to_storage(
         Ok(())
     }.await;
 
+    // Handle upload result - clean up on failure
     if let Err(e) = &transfer_result {
-        eprintln!("❌ Transfer failed: {}", e);
-        eprintln!("🧹 Aborting multipart upload...");
+        eprintln!("[Worker {}] ❌ Transfer failed: {}", worker_id, e);
+        eprintln!("[Worker {}] 🧹 Aborting multipart upload (upload_id: {})...", worker_id, upload_id);
         
+        // Always try to abort the multipart upload to clean up partial data
         if let Err(abort_err) = s3_client
             .abort_multipart_upload()
             .bucket(cfg.storage_bucket.clone())
@@ -561,7 +606,9 @@ async fn upload_to_storage(
             .send()
             .await 
         {
-            eprintln!("⚠️ Failed to abort MPU: {}", abort_err);
+            eprintln!("[Worker {}] ⚠️ Failed to abort MPU: {}", worker_id, abort_err);
+        } else {
+            println!("[Worker {}] ✅ Successfully aborted partial upload", worker_id);
         }
     }
     

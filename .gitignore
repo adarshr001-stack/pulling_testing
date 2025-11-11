@@ -1,2 +1,16 @@
-/target
-venv
+# Rust build artifacts
+/target/
+**/*.rlib
+
+# Python virtual environment
+/venv/
+*.pyc
+__pycache__/
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+
+# Logs
+*.log

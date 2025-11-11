@@ -1,10 +1,22 @@
 use std::net::TcpStream;
-use anyhow::{Result, Context};
+use anyhow::{Result, Context, anyhow};
 use std::env;
-use std::io::{Read, Write};
+use std::io::Read;
 use ssh2::{Session, File};
 use std::path::Path;
 use std::fs;
+
+// --- AWS Imports ---
+use aws_config::{self};
+use aws_credential_types::provider::SharedCredentialsProvider;
+use aws_credential_types::Credentials;
+use aws_sdk_s3::{config::Builder, primitives::ByteStream, Client as S3Client,
+    types::{CompletedMultipartUpload, CompletedPart},
+};
+use aws_types::region::Region;
+
+// --- Tokio/Bytes Imports ---
+use bytes::Bytes;
 use tokio;
 use std::sync::Arc;
 //env UPLOAD_CHUNK_SIZE_MB=10 time -l ./target/release/sftp_puller_main
@@ -24,10 +36,14 @@ struct Config {
     bank_private_key_content: Option<String>,
     bank_remote_path: String,
 
-    local_storage_path: String, // Local directory to store downloaded files
+    storage_endpoint: String,
+    storage_access_key: String,
+    storage_secret_key: String,
+    storage_bucket: String,
+    storage_region: String,
 
-    upload_chunk_size: usize, // e.g., 10 * 1024 * 1024 for 10MB (used for read buffer)
-    max_concurrent_uploads: usize, // Number of parallel downloads
+    upload_chunk_size: usize, // e.g., 10 * 1024 * 1024 for 10MB
+    max_concurrent_uploads: usize, // Number of parallel threads
 }
 
 impl Config {
@@ -41,7 +57,11 @@ impl Config {
             bank_private_key_path: env::var("BANK_PRIVATE_KEY_PATH").ok(),
             bank_private_key_content: env::var("BANK_PRIVATE_KEY_CONTENT").ok(),
             bank_remote_path: env::var("BANK_REMOTE_PATH")?,
-            local_storage_path: env::var("LOCAL_STORAGE_PATH")?,
+            storage_endpoint: env::var("STORAGE_ENDPOINT")?,
+            storage_access_key: env::var("STORAGE_ACCESS_KEY")?,
+            storage_secret_key: env::var("STORAGE_SECRET_KEY")?,
+            storage_bucket: env::var("STORAGE_BUCKET")?,
+            storage_region: env::var("STORAGE_REGION")?,
             upload_chunk_size: env::var("UPLOAD_CHUNK_SIZE_MB")
                 .unwrap_or_else(|_| "10".to_string())
                 .parse::<usize>()? * 1024 * 1024,
@@ -138,10 +158,8 @@ async fn main() -> Result<()> {
     // Create semaphore to limit concurrent uploads
     let semaphore = Arc::new(Semaphore::new(cfg.max_concurrent_uploads));
     
-    // Ensure local storage directory exists
-    fs::create_dir_all(&cfg.local_storage_path)
-        .context("Failed to create local storage directory")?;
-    println!("Local storage directory: {}", cfg.local_storage_path);
+    // Create S3 client (shared across all workers)
+    let s3_client = Arc::new(create_s3_client(&cfg).await?);
     
     // Spawn worker tasks
     let mut handles = vec![];
@@ -150,6 +168,7 @@ async fn main() -> Result<()> {
         let cfg_clone = cfg.clone();
         let state_clone = Arc::clone(&state);
         let semaphore_clone = Arc::clone(&semaphore);
+        let s3_client_clone = Arc::clone(&s3_client);
         
         let handle = tokio::spawn(async move {
             worker_task(
@@ -157,6 +176,7 @@ async fn main() -> Result<()> {
                 cfg_clone,
                 state_clone,
                 semaphore_clone,
+                s3_client_clone,
             ).await
         });
         
@@ -193,6 +213,7 @@ async fn worker_task(
     cfg: Config,
     state: Arc<FileProcessingState>,
     semaphore: Arc<Semaphore>,
+    s3_client: Arc<S3Client>,
 ) {
     println!("[Worker {}] Started", worker_id);
     
@@ -221,13 +242,13 @@ async fn worker_task(
                 let mut cfg_file = cfg.clone();
                 cfg_file.bank_remote_path = file_path.clone();
                 
-                match download_to_local_disk(worker_id, &cfg_file, Arc::new(sftp)).await {
+                match upload_to_storage(worker_id, &cfg_file, Arc::new(sftp), (*s3_client).clone()).await {
                     Ok(_) => {
-                        println!("[Worker {}] ✅ Successfully downloaded: {}", worker_id, file_path);
+                        println!("[Worker {}] ✅ Successfully uploaded: {}", worker_id, file_path);
                         state.mark_completed(&file_path).await;
                     }
                     Err(e) => {
-                        eprintln!("[Worker {}] ❌ Failed to download {}: {}", worker_id, file_path, e);
+                        eprintln!("[Worker {}] ❌ Failed to upload {}: {}", worker_id, file_path, e);
                         state.mark_failed(&file_path).await;
                     }
                 }
@@ -364,46 +385,69 @@ async fn create_sftp_session(cfg: &Config) -> Result<ssh2::Sftp> {
     Ok(sftp)
 }
 
-async fn download_to_local_disk(
+async fn create_s3_client(cfg: &Config) -> Result<S3Client> {
+    let region = Region::new(cfg.storage_region.clone());
+
+    let base_config = aws_config::from_env()
+        .region(region.clone())
+        .load()
+        .await;
+
+    let credentials = Credentials::new(
+        &cfg.storage_access_key,
+        &cfg.storage_secret_key,
+        None,
+        None,
+        "custom",
+    );
+
+    let credentials_provider = SharedCredentialsProvider::new(credentials);
+
+    let s3_config = Builder::from(&base_config)
+        .region(region)
+        .endpoint_url(cfg.storage_endpoint.clone())
+        .credentials_provider(credentials_provider)
+        .build();
+
+    let client = S3Client::from_conf(s3_config);
+
+    Ok(client)
+}
+
+async fn upload_to_storage(
     worker_id: usize,
     cfg: &Config,
     sftp: Arc<ssh2::Sftp>,
+    s3_client: S3Client,
 ) -> Result<()> {
-    // Determine the local file path
-    // Remove leading slash from remote path to create relative path
-    let remote_path = cfg.bank_remote_path.trim_start_matches('/');
-    let local_file_path = Path::new(&cfg.local_storage_path).join(remote_path);
     
-    println!("[Worker {}] Downloading {} -> {}", worker_id, cfg.bank_remote_path, local_file_path.display());
-    
-    // Create parent directories if they don't exist
-    if let Some(parent) = local_file_path.parent() {
-        fs::create_dir_all(parent)
-            .context(format!("Failed to create directory: {}", parent.display()))?;
-    }
-    
-    // Create temporary file for atomic write
-    let temp_file_path = local_file_path.with_extension("tmp");
-    
-    let transfer_result = async {
-        // Open SFTP file for reading
+    // 1. Initiate Upload
+    let mpu = s3_client
+        .create_multipart_upload()
+        .bucket(cfg.storage_bucket.clone())
+        .key(cfg.bank_remote_path.clone())
+        .send()
+        .await?;
+
+    let upload_id = mpu.upload_id().ok_or_else(|| anyhow!("S3 response missing UploadId"))?;
+    println!("[Worker {}] ({}) Initiated MPU. UploadId: {}", worker_id, cfg.bank_remote_path, upload_id);
+
+    // This block ensures we abort the MPU on any error
+    let transfer_result = async { 
+        // 2. Store State (In-Memory)
+        let mut part_number = 1;
+        let mut completed_parts = Vec::new();
+
+        // 3. Connect to SFTP (in a blocking task)
         let mut sftp_file = tokio::task::spawn_blocking({
             let sftp_path = cfg.bank_remote_path.clone();
             let sftp_arc = Arc::clone(&sftp);
             move || -> Result<File> {
-                sftp_arc.open(Path::new(&sftp_path))
-                    .context(format!("SFTP file open failed: {}", sftp_path))
+                sftp_arc.open(Path::new(&sftp_path)).context(format!("SFTP file open failed: {}", sftp_path))
             }
         }).await??;
 
-        // Open local file for writing
-        let mut local_file = fs::File::create(&temp_file_path)
-            .context(format!("Failed to create local file: {}", temp_file_path.display()))?;
-
-        let mut total_bytes = 0;
-        let mut chunk_number = 1;
-
-        // Stream data in chunks
+        // 4. Stream Parts
         loop {
             let (file_out, read_result) = tokio::task::spawn_blocking({
                 let mut sftp_file_ref = sftp_file;
@@ -431,52 +475,96 @@ async fn download_to_local_disk(
             }).await?;
 
             sftp_file = file_out;
-            let (buffer, bytes_read) = read_result?;
+            let (mut buffer, bytes_read) = read_result?;
 
             if bytes_read == 0 {
-                println!("[Worker {}] ({}) End of file reached. Total bytes: {}", 
-                         worker_id, cfg.bank_remote_path, total_bytes);
+                println!("[Worker {}] ({}) End of file reached.", worker_id, cfg.bank_remote_path);
                 break;
             }
 
-            // Write chunk to local file
-            local_file.write_all(&buffer[..bytes_read])
-                .context(format!("Failed to write chunk {} to local file", chunk_number))?;
+            println!("[Worker {}] ({}) Read chunk of {} bytes for part {}", worker_id, cfg.bank_remote_path, bytes_read, part_number);
+            buffer.truncate(bytes_read);
+
+            // 6. Upload Part
+            let part_resp = s3_client
+                .upload_part()
+                .bucket(cfg.storage_bucket.clone())
+                .key(cfg.bank_remote_path.clone())
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .body(ByteStream::from(buffer))
+                .send()
+                .await
+                .context(format!("S3 UploadPart {} failed", part_number))?;
             
-            total_bytes += bytes_read;
-            println!("[Worker {}] ({}) Written chunk {} ({} bytes, total: {} bytes)", 
-                     worker_id, cfg.bank_remote_path, chunk_number, bytes_read, total_bytes);
+            let etag = part_resp.e_tag().ok_or_else(|| anyhow!("S3 response missing ETag for part {}", part_number))?;
             
-            chunk_number += 1;
+            println!("[Worker {}] ({}) Uploaded part {}", worker_id, cfg.bank_remote_path, part_number);
+
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(etag)
+                    .build(),
+            );
+
+            part_number += 1;
         }
 
-        // Flush and sync to ensure all data is written
-        local_file.flush()
-            .context("Failed to flush local file")?;
-        local_file.sync_all()
-            .context("Failed to sync local file")?;
-        
-        drop(local_file);
+        // 8. Finalize Transfer
+        if !completed_parts.is_empty() {
+            println!("[Worker {}] ({}) Completing multipart upload...", worker_id, cfg.bank_remote_path);
+            let mpu_completion = CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build();
 
-        // Atomic rename from temp file to final file
-        fs::rename(&temp_file_path, &local_file_path)
-            .context(format!("Failed to rename temp file to final file: {}", local_file_path.display()))?;
-
-        println!("[Worker {}] ({}) ✓ Download complete: {} bytes written to {}", 
-                 worker_id, cfg.bank_remote_path, total_bytes, local_file_path.display());
+            s3_client
+                .complete_multipart_upload()
+                .bucket(cfg.storage_bucket.clone())
+                .key(cfg.bank_remote_path.clone())
+                .upload_id(upload_id)
+                .multipart_upload(mpu_completion)
+                .send()
+                .await
+                .context("Failed to complete multipart upload")?;
+        } else {
+            println!("[Worker {}] ({}) File was empty, aborting MPU and creating empty object.", worker_id, cfg.bank_remote_path);
+            
+            s3_client
+                .abort_multipart_upload()
+                .bucket(cfg.storage_bucket.clone())
+                .key(cfg.bank_remote_path.clone())
+                .upload_id(upload_id)
+                .send()
+                .await
+                .context("Failed to abort MPU for empty file")?;
+            
+            s3_client
+                .put_object()
+                .bucket(cfg.storage_bucket.clone())
+                .key(cfg.bank_remote_path.clone())
+                .body(ByteStream::from(Bytes::new()))
+                .send()
+                .await
+                .context("Failed to upload 0-byte empty file")?;
+        }
 
         Ok(())
+
     }.await;
 
-    // Clean up temp file on error
     if let Err(e) = &transfer_result {
-        eprintln!("[Worker {}] ({}) Error during download: {}", worker_id, cfg.bank_remote_path, e);
-        if temp_file_path.exists() {
-            if let Err(remove_err) = fs::remove_file(&temp_file_path) {
-                eprintln!("[Worker {}] ({}) Failed to remove temp file: {}", worker_id, cfg.bank_remote_path, remove_err);
+        eprintln!("[Worker {}] ({}) Aborting MPU due to error: {}", worker_id, cfg.bank_remote_path, e);
+        if let Err(abort_err) = s3_client
+            .abort_multipart_upload()
+            .bucket(cfg.storage_bucket.clone())
+            .key(cfg.bank_remote_path.clone())
+            .upload_id(upload_id)
+            .send()
+            .await {
+                eprintln!("[Worker {}] ({}) CRITICAL: Failed to abort MPU: {}", worker_id, cfg.bank_remote_path, abort_err);
             }
-        }
     }
-
+    
     transfer_result
 }
