@@ -15,7 +15,9 @@ anyhow = "1.0"              # Error handling
 tracing = "0.1"             # Logging
 dotenv = "0.15"        # load .env file
 base64 = "0.21"        # For decoding private key content
-
+ssh-key = { version = "0.6", features = ["alloc", "std", "rsa"] }  # For OpenSSH key parsing
+rsa = { version = "0.9", features = ["pem"] }  # For RSA key handling
+pkcs1 = { version = "0.7", features = ["pem"] }  # For PKCS#1 PEM encoding
 
 # Extra helpers for custom endpoint + credentials
 aws-credential-types = "1.2"
@@ -24,3 +26,4 @@ reqwest = "0.12.24"
 bytes = "1.10.1"
 tokio-stream = "0.1.17"
 rusqlite = "0.37.0"
+sysinfo = "0.37.2"
